@@ -4,6 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>나만의 스마트 단어장</title>
+    <!-- 실시간 기기 동기화를 위한 Firebase SDK -->
+    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js"></script>
     <style>
         :root {
             --primary-color: #4CAF50;
@@ -62,6 +65,7 @@
 
         .backup-controls {
             display: flex;
+            flex-wrap: wrap;
             gap: 8px;
             margin-bottom: 15px;
         }
@@ -76,6 +80,12 @@
             color: #4a5568;
         }
         .btn-sub:hover { background-color: #e2e8f0; }
+
+        .btn-sync-active {
+            background-color: #e8f5e9;
+            border-color: #4CAF50;
+            color: #2e7d32;
+        }
 
         h2 { margin: 0; font-size: 20px; }
 
@@ -662,7 +672,34 @@
         <div class="backup-controls">
             <button class="btn-sub" onclick="exportData()">💾 백업 내보내기</button>
             <button class="btn-sub" onclick="document.getElementById('import-file').click()">📂 백업 불러오기</button>
+            <button id="btn-cloud-sync" class="btn-sub" onclick="openCloudSyncModal()">☁️ 실시간 동기화</button>
             <input type="file" id="import-file" style="display: none;" accept=".json" onchange="importData(event)">
+        </div>
+
+        <!-- 실시간 클라우드 동기화 설정 모달 -->
+        <div id="cloud-sync-overlay" class="modal-overlay">
+            <div class="modal-box">
+                <h3>☁️ 기기 간 실시간 동기화</h3>
+                <p style="font-size: 12px; color: #666; line-height: 1.5;">
+                    Firebase Realtime Database 주소와 본인만의 동기화 키를 입력하면 모든 기기에서 단어·오답·예문이 실시간으로 함께 업데이트됩니다.
+                </p>
+                <div style="margin-bottom: 10px;">
+                    <label style="font-size: 12px; font-weight: bold; color: #4a5568; display: block; margin-bottom: 4px;">Firebase DB 주소 (URL)</label>
+                    <input type="text" id="cloud-db-url-input" class="example-form-field" placeholder="https://프로젝트명-default-rtdb.firebaseio.com">
+                </div>
+                <div style="margin-bottom: 12px;">
+                    <label style="font-size: 12px; font-weight: bold; color: #4a5568; display: block; margin-bottom: 4px;">동기화 암호키 (모든 기기 동일하게 입력)</label>
+                    <input type="text" id="cloud-sync-key-input" class="example-form-field" placeholder="예: wooseok-vocab-1234">
+                </div>
+                <div id="cloud-sync-status-text" style="font-size: 12px; margin-bottom: 12px; color: #64748b; font-weight: bold;">상태: 미연결</div>
+                <button class="btn-test" style="margin-bottom: 8px; padding: 12px;" onclick="saveAndConnectCloudSync()">🔗 연동 시작 (실시간 동기화)</button>
+                <div style="display: flex; gap: 6px; margin-bottom: 8px;">
+                    <button class="btn-sub" style="flex: 1; padding: 10px;" onclick="forcePushToCloud()">⬆️ 현재 기기 데이터 업로드</button>
+                    <button class="btn-sub" style="flex: 1; padding: 10px;" onclick="forcePullFromCloud()">⬇️ 클라우드 데이터 내려받기</button>
+                </div>
+                <button class="btn-sub" style="width: 100%; padding: 10px; color: var(--danger-color); margin-bottom: 8px;" onclick="disconnectCloudSync()">🔌 연동 해제</button>
+                <button class="btn-sub" style="width: 100%; padding: 10px;" onclick="closeCloudSyncModal()">닫기</button>
+            </div>
         </div>
 
         <ul id="file-list"></ul>
@@ -896,6 +933,14 @@
         // 예문 수정 상태 변수
         let editingExampleIndex = null;
 
+        // 실시간 클라우드 동기화 상태 변수
+        let cloudSyncConfig = JSON.parse(localStorage.getItem('vocabCloudConfig')) || { dbUrl: '', syncKey: '' };
+        let firebaseAppInstance = null;
+        let firebaseDbRef = null;
+        let isApplyingRemoteUpdate = false;
+        let clientDeviceId = localStorage.getItem('vocabDeviceId') || ('dev-' + Math.random().toString(36).substring(2, 10));
+        localStorage.setItem('vocabDeviceId', clientDeviceId);
+
         const SPECIAL_FILE_NAME = '헷갈릴 수 있는 단어 모음';
         const SAME_MEANING_FILE_NAME = '같은 뜻 단어 모음';
         const OVERLAP_WORD_FILE_NAME = '겹치는 영단어 모음';
@@ -920,6 +965,10 @@
 
             consolidateOverlappingEnglishWords();
             navigate('home');
+
+            if (cloudSyncConfig.dbUrl && cloudSyncConfig.syncKey) {
+                initCloudSyncConnection(false);
+            }
             
             document.querySelectorAll('.add-form input').forEach(input => {
                 input.addEventListener('focus', function() {
@@ -941,6 +990,207 @@
                 saveCurrentSessionState();
             }
         });
+
+        // ==========================================
+        // 실시간 클라우드 동기화 (Firebase Realtime DB)
+        // ==========================================
+        function openCloudSyncModal() {
+            document.getElementById('cloud-db-url-input').value = cloudSyncConfig.dbUrl || '';
+            document.getElementById('cloud-sync-key-input').value = cloudSyncConfig.syncKey || '';
+            document.getElementById('cloud-sync-overlay').style.display = 'flex';
+        }
+
+        function closeCloudSyncModal() {
+            document.getElementById('cloud-sync-overlay').style.display = 'none';
+        }
+
+        function updateCloudSyncUI(connected, message) {
+            const btn = document.getElementById('btn-cloud-sync');
+            const statusText = document.getElementById('cloud-sync-status-text');
+            if (connected) {
+                btn.classList.add('btn-sync-active');
+                btn.innerText = '🟢 실시간 동기화중';
+                if (statusText) {
+                    statusText.style.color = '#2e7d32';
+                    statusText.innerText = message || '상태: 실시간 동기화 연결됨';
+                }
+            } else {
+                btn.classList.remove('btn-sync-active');
+                btn.innerText = '☁️ 실시간 동기화';
+                if (statusText) {
+                    statusText.style.color = '#64748b';
+                    statusText.innerText = message || '상태: 미연결';
+                }
+            }
+        }
+
+        function hasMeaningfulLocalData() {
+            const keys = Object.keys(vocabData || {});
+            if (keys.length === 0) return false;
+            if (keys.length === 1 && keys[0] === BLUE_FILE_NAME && (vocabData[BLUE_FILE_NAME] || []).length === 0) {
+                return false;
+            }
+            return true;
+        }
+
+        function saveAndConnectCloudSync() {
+            let dbUrl = document.getElementById('cloud-db-url-input').value.trim();
+            const syncKey = document.getElementById('cloud-sync-key-input').value.trim();
+
+            if (!dbUrl || !syncKey) {
+                alert('Firebase DB 주소와 동기화 암호키를 모두 입력해주세요.');
+                return;
+            }
+            if (dbUrl.endsWith('/')) {
+                dbUrl = dbUrl.slice(0, -1);
+            }
+
+            cloudSyncConfig = { dbUrl, syncKey };
+            localStorage.setItem('vocabCloudConfig', JSON.stringify(cloudSyncConfig));
+            initCloudSyncConnection(true);
+        }
+
+        function initCloudSyncConnection(showAlert = false) {
+            if (!cloudSyncConfig.dbUrl || !cloudSyncConfig.syncKey) return;
+
+            try {
+                if (firebaseDbRef) {
+                    firebaseDbRef.off();
+                }
+
+                const safeKey = cloudSyncConfig.syncKey.replace(/[.#$\[\]\/]/g, '_');
+                if (!firebase.apps.length) {
+                    firebaseAppInstance = firebase.initializeApp({ databaseURL: cloudSyncConfig.dbUrl });
+                } else {
+                    firebaseAppInstance = firebase.app();
+                }
+
+                firebaseDbRef = firebase.database().ref('vocabSync/' + safeKey);
+
+                firebaseDbRef.once('value').then(snapshot => {
+                    const remoteVal = snapshot.val();
+                    if (remoteVal && remoteVal.vocabDataJson) {
+                        applyCloudSnapshot(remoteVal);
+                    } else if (hasMeaningfulLocalData()) {
+                        pushAllDataToCloud();
+                    }
+                    updateCloudSyncUI(true, `상태: '${cloudSyncConfig.syncKey}' 실시간 연동중`);
+                    if (showAlert) {
+                        alert('실시간 동기화가 연결되었습니다! 이제 모든 기기에서 실시간으로 반영됩니다.');
+                        closeCloudSyncModal();
+                    }
+
+                    firebaseDbRef.on('value', snap => {
+                        const data = snap.val();
+                        if (!data || !data.vocabDataJson) return;
+                        if (data.senderId === clientDeviceId) return;
+                        applyCloudSnapshot(data);
+                    });
+                }).catch(err => {
+                    updateCloudSyncUI(false, '상태: 연결 오류 (DB 주소 또는 규칙 확인)');
+                    if (showAlert) {
+                        alert('DB 연결에 실패했습니다. Firebase Realtime Database 주소와 규칙(테스트 모드)을 확인해주세요.');
+                    }
+                });
+            } catch (err) {
+                updateCloudSyncUI(false, '상태: 설정 오류');
+                if (showAlert) {
+                    alert('연동 초기화 중 오류가 발생했습니다: ' + err.message);
+                }
+            }
+        }
+
+        function applyCloudSnapshot(data) {
+            isApplyingRemoteUpdate = true;
+            try {
+                if (data.vocabDataJson) {
+                    vocabData = JSON.parse(data.vocabDataJson) || {};
+                    localStorage.setItem('vocabApp', JSON.stringify(vocabData));
+                }
+                if (data.wrongStudyCountsJson) {
+                    wrongStudyCounts = JSON.parse(data.wrongStudyCountsJson) || {};
+                    localStorage.setItem('vocabWrongStudy', JSON.stringify(wrongStudyCounts));
+                }
+                if (data.wrongStudyProgressJson) {
+                    wrongStudyProgress = JSON.parse(data.wrongStudyProgressJson) || {};
+                    localStorage.setItem('vocabWrongStudyProgress', JSON.stringify(wrongStudyProgress));
+                }
+                if (data.savedSessionsJson) {
+                    savedSessions = JSON.parse(data.savedSessionsJson) || {};
+                    localStorage.setItem('vocabSavedSessions', JSON.stringify(savedSessions));
+                }
+
+                if (!vocabData[BLUE_FILE_NAME]) {
+                    vocabData[BLUE_FILE_NAME] = [];
+                }
+
+                if (document.getElementById('home-view').classList.contains('active')) {
+                    renderFileList();
+                } else if (document.getElementById('file-view').classList.contains('active')) {
+                    if (currentFile && vocabData[currentFile]) {
+                        renderWordList();
+                    } else {
+                        navigate('home');
+                    }
+                }
+            } catch (e) {
+                console.error('클라우드 데이터 반영 오류:', e);
+            } finally {
+                isApplyingRemoteUpdate = false;
+            }
+        }
+
+        function pushAllDataToCloud() {
+            if (isApplyingRemoteUpdate || !firebaseDbRef) return;
+            try {
+                firebaseDbRef.set({
+                    vocabDataJson: JSON.stringify(vocabData),
+                    wrongStudyCountsJson: JSON.stringify(wrongStudyCounts),
+                    wrongStudyProgressJson: JSON.stringify(wrongStudyProgress),
+                    savedSessionsJson: JSON.stringify(savedSessions),
+                    updatedAt: Date.now(),
+                    senderId: clientDeviceId
+                });
+            } catch (e) {
+                console.error('클라우드 업로드 오류:', e);
+            }
+        }
+
+        function forcePushToCloud() {
+            if (!firebaseDbRef) {
+                alert('먼저 연동 시작 버튼을 눌러 연결해주세요.');
+                return;
+            }
+            pushAllDataToCloud();
+            alert('현재 기기의 데이터를 클라우드에 업로드했습니다.');
+        }
+
+        function forcePullFromCloud() {
+            if (!firebaseDbRef) {
+                alert('먼저 연동 시작 버튼을 눌러 연결해주세요.');
+                return;
+            }
+            firebaseDbRef.once('value').then(snap => {
+                const data = snap.val();
+                if (data && data.vocabDataJson) {
+                    applyCloudSnapshot(data);
+                    alert('클라우드에서 최신 데이터를 불러왔습니다.');
+                } else {
+                    alert('클라우드에 저장된 데이터가 없습니다.');
+                }
+            });
+        }
+
+        function disconnectCloudSync() {
+            if (firebaseDbRef) {
+                firebaseDbRef.off();
+                firebaseDbRef = null;
+            }
+            cloudSyncConfig = { dbUrl: '', syncKey: '' };
+            localStorage.removeItem('vocabCloudConfig');
+            updateCloudSyncUI(false, '상태: 미연결');
+            alert('실시간 동기화 연동이 해제되었습니다.');
+        }
 
         function insertParentheses(event, inputId) {
             event.preventDefault();
@@ -988,18 +1238,22 @@
 
         function saveData() {
             localStorage.setItem('vocabApp', JSON.stringify(vocabData));
+            pushAllDataToCloud();
         }
 
         function saveWrongStudy() {
             localStorage.setItem('vocabWrongStudy', JSON.stringify(wrongStudyCounts));
+            pushAllDataToCloud();
         }
 
         function saveWrongStudyProgress() {
             localStorage.setItem('vocabWrongStudyProgress', JSON.stringify(wrongStudyProgress));
+            pushAllDataToCloud();
         }
 
         function saveSessionsToStorage() {
             localStorage.setItem('vocabSavedSessions', JSON.stringify(savedSessions));
+            pushAllDataToCloud();
         }
 
         function getSessionKey() {
